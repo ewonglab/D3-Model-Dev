@@ -1,0 +1,12 @@
+# Base configuration file with wandb logging enabled
+# Use this by running: python train.py --config-name=wandb_config
+
+# Import base config
+defaults:
+  - config  # Import all settings from the base config.yaml
+  - _self_  # Allow this file to override imported configs
+
+# Weights & Biases configuration
+wandb_project: "c5-d3-diffusion"  # Replace with your desired project name
+wandb_entity: null              # Optional: your wandb username or team name
+wandb_tags: ["C5", "D3", "diffusion", "heart-sequences"]

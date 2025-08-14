@@ -1,0 +1,80 @@
+defaults:
+  - _self_
+  - model: small
+  - override hydra/launcher: submitit_slurm
+
+# Wandb configuration
+wandb_project: null  # Set to null by default, override via command line
+wandb_name: null
+
+ngpus: 1
+tokens: 4
+training:
+  batch_size: 64  # Smaller batch size for fine-tuning
+  accum: 1
+  n_iters: 3200  # Fewer iterations for fine-tuning
+  snapshot_freq: 500
+  log_freq: 50
+  eval_freq: 100
+  snapshot_freq_for_preemption: 200
+  weight: standard
+  snapshot_sampling: true
+  ema: 0.9999
+data:
+  train: fine_tune_dataset  # Set to your fine-tuning dataset
+  valid: fine_tune_dataset
+  cache_dir: data
+graph:
+  type: uniform
+  file: data
+  report_all: false
+noise:
+  type: geometric
+  sigma_min: 0.0001
+  sigma_max: 20
+sampling:
+  predictor: euler
+  steps: 128
+  noise_removal: true
+eval:
+  batch_size: 64
+  perplexity: false
+  perplexity_batch_size: 16
+optim:
+  weight_decay: 0
+  optimizer: AdamW
+  lr: 0.00005  # Lower learning rate for fine-tuning
+  beta1: 0.9
+  beta2: 0.999
+  eps: 1.0e-08
+  warmup: 500
+  grad_clip: 1.0
+model:
+  name: small
+  type: ddit
+  hidden_size: 768
+  cond_dim: 256
+  length: 200
+  n_blocks: 12
+  n_heads: 12
+  scale_by_sigma: false
+  dropout: 0.1
+
+# Mode for 2-stage training
+mode: fine-tuning  # Options: pretraining, fine-tuning
+
+hydra:
+  run:
+    dir: exp_local/${data.train}/${now:%Y.%m.%d}/${now:%H%M%S}
+  sweep:
+    dir: exp/${data.train}/${now:%Y.%m.%d}/${now:%H%M%S}
+    subdir: ${hydra.job.num}
+  launcher:
+    max_num_timeout: 100000
+    # timeout_min: 10079
+    partition: g40x
+    account: null
+    mem_gb: 96
+    cpus_per_task: 40
+    gpus_per_node: ${ngpus}
+    constraint: null 

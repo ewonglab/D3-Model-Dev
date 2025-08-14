@@ -1,0 +1,7 @@
+# Ignore all checkpoints inside exp_local folder but keep the folder
+exp_local/*
+!exp_local/.gitkeep
+
+# Ignore python cache
+__pycache__/
+*.py[cod]
