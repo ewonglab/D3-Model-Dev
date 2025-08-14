@@ -1,6 +1,14 @@
-# CLAUDE.md
+## ⚡ Quick Start
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+### Installation
+```bash
+# Clone repository
+git clone https://github.com/your-repo/D3-DNA-Discrete-Diffusion.git
+cd D3-DNA-Discrete-Diffusion
+
+# Install in development mode (recommended)
+pip install -e .
+```
 
 ## Development Commands
 
