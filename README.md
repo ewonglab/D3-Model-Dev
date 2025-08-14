@@ -3,8 +3,8 @@
 ### Installation
 ```bash
 # Clone repository
-git clone https://github.com/your-repo/D3-DNA-Discrete-Diffusion.git
-cd D3-DNA-Discrete-Diffusion
+git clone https://github.com/ewonglab/D3-Model-Dev
+cd D3-Model-Dev
 
 # Install in development mode (recommended)
 pip install -e .
