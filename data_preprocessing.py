@@ -129,8 +129,8 @@ def convert_to_one_hot(sequences, target_length=200):
 
 def main():
     # Define paths
-    data_dir = "generated_c5_human_heart_seqs"
-    output_file = "generated_c5_human_heart_data.h5"
+    data_dir = "data/processed"
+    output_file = "data/c5_human_heart_data.h5"
 
     # Define cell types and create mapping
     cell_types = [

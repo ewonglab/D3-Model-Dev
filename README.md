@@ -35,7 +35,7 @@ pip install -e .
 
 ### Data Pipeline
 - **Input**: HDF5 files with one-hot encoded DNA sequences (200bp length)
-- **Processing**: `src/data/data_processing.py` handles data loading and batching
+- **Processing**: `data_processing.py` handles data loading and batching
 - **Format**: Sequences stored as (batch, sequence_length) with 4-class tokens (A,C,G,T)
 - **Main dataset**: `data/c5_human_heart_data.h5` for human heart regulatory sequences
 
