@@ -4,10 +4,10 @@ import sys
 import glob
 import json
 
-import data
+from src import data
 from src.load_model import load_model_local
 import torch.nn.functional as F
-import sampling as sampling
+from src import sampling
 import h5py, os
 import numpy as np
 from torch.utils.data import DataLoader, TensorDataset, DistributedSampler
