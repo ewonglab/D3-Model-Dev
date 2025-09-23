@@ -4,8 +4,10 @@ import torch.nn.functional as F
 import numpy as np
 import math
 from sklearn.decomposition import PCA
+from typing import Optional, Dict, Any, List, Tuple
+from dataclasses import dataclass
 
-from einops import rearrange
+from einops import rearrange, einsum
 from flash_attn.flash_attn_interface import flash_attn_varlen_qkvpacked_func
 
 # from flash_attn.ops.fused_dense import FusedMLP, FusedDense
@@ -23,6 +25,15 @@ from .fused_add_dropout_scale import (
 
 def modulate(x, shift, scale):
     return x * (1 + scale.unsqueeze(1)) + shift.unsqueeze(1)
+
+
+@dataclass
+class ConceptAttentionOutput:
+    """Output structure for concept attention analysis"""
+    sequences: torch.Tensor
+    concept_attention_maps: Dict[str, torch.Tensor]
+    cell_type_concepts: List[str]
+    attention_weights: torch.Tensor
 
 
 #################################################################################
@@ -136,6 +147,248 @@ class LabelEmbedder(nn.Module):
 #################################################################################
 #                                 Core Model                                    #
 #################################################################################
+
+
+class CellTypeConceptDDiTBlock(nn.Module):
+    """
+    Enhanced DDiTBlock with Cell-Type ConceptAttention for DNA sequence generation.
+
+    Updated version: Concept queries attend to DNA keys, allowing concepts to
+    "look at" and attend to specific regions in the DNA sequence.
+
+    This block enables the model to:
+    1. Understand which DNA regions each cell-type concept focuses on
+    2. Generate sequences with explicit cell-type regulatory patterns
+    3. Visualize how cell type concepts attend to different DNA regions
+    """
+
+    def __init__(self, dim, n_heads, cond_dim, mlp_ratio=4, dropout=0.1,
+                 num_cell_types=5, concept_attention_layers=None):
+        super().__init__()
+
+        # Original DDiTBlock components
+        self.n_heads = n_heads
+        self.dim = dim
+
+        # DNA sequence attention components
+        self.norm1 = LayerNorm(dim)
+        self.attn_qkv = nn.Linear(dim, 3 * dim, bias=False)
+        self.attn_out = nn.Linear(dim, dim, bias=False)
+        self.dropout1 = nn.Dropout(dropout)
+
+        self.norm2 = LayerNorm(dim)
+        self.mlp = nn.Sequential(
+            nn.Linear(dim, mlp_ratio * dim, bias=True),
+            nn.GELU(approximate="tanh"),
+            nn.Linear(mlp_ratio * dim, dim, bias=True),
+        )
+        self.dropout2 = nn.Dropout(dropout)
+
+        self.dropout = dropout
+
+        self.adaLN_modulation = nn.Linear(cond_dim, 6 * dim, bias=True)
+        self.adaLN_modulation.weight.data.zero_()
+        self.adaLN_modulation.bias.data.zero_()
+
+        # ConceptAttention components for cell types
+        self.concept_attention_layers = concept_attention_layers or list(range(15, 19))
+
+        # DNA key/value projections for concept attention
+        self.dna_proj_k = nn.Linear(dim, dim, bias=False)
+        self.dna_proj_v = nn.Linear(dim, dim, bias=False)
+
+        # Concept query projection
+        self.concept_proj_q = nn.Linear(dim, dim, bias=False)
+
+        # Normalization layers
+        self.concept_norm = LayerNorm(dim)
+        self.dna_norm = LayerNorm(dim)
+
+        # Output projection for concept-attended features
+        self.concept_out_proj = nn.Linear(dim, dim, bias=False)
+
+        # Storage for concept attention visualization
+        self.concept_attention_storage = {}
+
+        # For storing attention scores (original functionality)
+        self.attention_scores = None
+        self.save_attention = False
+
+    def store_concept_attention(self, attention_data: Dict[str, torch.Tensor]):
+        """Store concept attention data for visualization"""
+        self.concept_attention_storage.update(attention_data)
+
+    def get_concept_attention(self) -> Dict[str, torch.Tensor]:
+        """Retrieve stored concept attention data"""
+        return self.concept_attention_storage
+
+    def _get_bias_dropout_scale(self):
+        """Same as original DDiTBlock"""
+        return (
+            bias_dropout_add_scale_fused_train
+            if self.training
+            else bias_dropout_add_scale_fused_inference
+        )
+
+    def forward(self, x, rotary_cos_sin, c, cell_type_concepts=None,
+                layer_idx=None, seqlens=None):
+        """
+        Forward pass with cell-type concept attention - PRESERVES ORIGINAL GENERATION
+
+        Updated: Concept queries attend to DNA keys to identify relevant DNA regions
+
+        Args:
+            x: DNA sequence embeddings [batch, seq_len, dim]
+            rotary_cos_sin: Rotary position embeddings
+            c: Conditioning vector from timestep/label embeddings
+            cell_type_concepts: Cell type concept embeddings [batch, num_concepts, dim]
+            layer_idx: Current layer index for selective concept attention
+            seqlens: Sequence lengths for variable length sequences
+        """
+
+        # Use default concept embeddings if not provided
+        if cell_type_concepts is None and hasattr(self, 'default_cell_type_concepts'):
+            cell_type_concepts = self.default_cell_type_concepts
+
+        # Use default layer index if not provided
+        if layer_idx is None and hasattr(self, 'default_layer_idx'):
+            layer_idx = self.default_layer_idx
+
+        batch_size, seq_len = x.shape[0], x.shape[1]
+        bias_dropout_scale_fn = self._get_bias_dropout_scale()
+
+        shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = (
+            self.adaLN_modulation(c)[:, None].chunk(6, dim=2)
+        )
+
+        # ===== EXACT SAME DNA ATTENTION AS ORIGINAL DDiTBlock =====
+        x_skip = x
+        x = modulate_fused(self.norm1(x), shift_msa, scale_msa)
+        qkv = self.attn_qkv(x)
+        qkv = rearrange(qkv, "b s (three h d) -> b s three h d", three=3, h=self.n_heads)
+
+        with torch.cuda.amp.autocast(enabled=False):
+            cos, sin = rotary_cos_sin
+            qkv = rotary.apply_rotary_pos_emb(qkv, cos.to(qkv.dtype), sin.to(qkv.dtype))
+
+        # ===== UPDATED CONCEPT ATTENTION: CONCEPT QUERIES -> DNA KEYS =====
+        q, k, v = qkv.unbind(dim=2)
+        concept_attention_weights = None
+        concept_attended_features = None
+
+        if (cell_type_concepts is not None and
+            layer_idx is not None and
+            layer_idx in self.concept_attention_layers):
+
+            # Project DNA sequences as keys and values for concept attention
+            dna_k = self.dna_proj_k(self.dna_norm(x))  # [batch, seq_len, dim]
+            dna_v = self.dna_proj_v(self.dna_norm(x))  # [batch, seq_len, dim]
+
+            # Project cell type concepts as queries
+            concept_q = self.concept_proj_q(self.concept_norm(cell_type_concepts))  # [batch, num_concepts, dim]
+
+            # Reshape for multi-head attention
+            dna_k = rearrange(dna_k, "b s (h d) -> b h s d", h=self.n_heads)
+            dna_v = rearrange(dna_v, "b s (h d) -> b h s d", h=self.n_heads)
+            concept_q = rearrange(concept_q, "b c (h d) -> b h c d", h=self.n_heads)
+
+            # Cross-attention: Concept queries attend to DNA keys
+            scale = (concept_q.shape[-1]) ** -0.5
+            concept_attention_weights = torch.einsum('b h c d, b h s d -> b h c s',
+                                                   concept_q, dna_k) * scale
+            concept_attention_weights = F.softmax(concept_attention_weights, dim=-1)
+
+            # Compute concept-attended DNA features
+            concept_attended_features = torch.einsum('b h c s, b h s d -> b h c d',
+                                                   concept_attention_weights, dna_v)
+            concept_attended_features = rearrange(concept_attended_features, "b h c d -> b c (h d)")
+
+            # Project back to original dimension
+            concept_attended_features = self.concept_out_proj(concept_attended_features)
+
+            # Store for visualization (doesn't affect generation)
+            self.store_concept_attention({
+                "concept_queries": concept_q,
+                "dna_keys": dna_k,
+                "dna_values": dna_v,
+                "concept_attention_weights": concept_attention_weights.detach().cpu(),
+                "concept_attended_features": concept_attended_features.detach().cpu(),
+                "layer_idx": layer_idx
+            })
+
+        # ===== EXACT SAME FLASH ATTENTION AS ORIGINAL =====
+        qkv = rearrange(qkv, "b s ... -> (b s) ...")
+        if seqlens is None:
+            cu_seqlens = torch.arange(
+                0,
+                (batch_size + 1) * seq_len,
+                step=seq_len,
+                dtype=torch.int32,
+                device=qkv.device,
+            )
+        else:
+            cu_seqlens = seqlens.cumsum(-1)
+
+        # Compute attention scores if needed (original functionality)
+        if self.save_attention:
+            # Need to properly reshape qkv back to batch format first
+            qkv_reshaped = rearrange(qkv, "(b s) ... -> b s ...", b=batch_size)
+
+            # Extract q, k, v from reshaped tensor
+            q_batch = qkv_reshaped[:, :, 0]  # Shape: [batch_size, seq_len, n_heads, dim]
+            k_batch = qkv_reshaped[:, :, 1]  # Shape: [batch_size, seq_len, n_heads, dim]
+
+            # Initialize tensor to store attention scores for all heads
+            attn_scores = []
+
+            # Calculate attention for each head
+            for head_idx in range(self.n_heads):
+                # Extract this head's queries and keys
+                q_head = q_batch[:, :, head_idx]  # [batch_size, seq_len, dim]
+                k_head = k_batch[:, :, head_idx]  # [batch_size, seq_len, dim]
+
+                # Compute attention matrix: [batch_size, seq_len, seq_len]
+                scale_factor = q_head.size(-1) ** 0.5
+                attn = (
+                    torch.bmm(
+                        q_head.view(batch_size, seq_len, -1),  # [batch_size, seq_len, dim]
+                        k_head.view(batch_size, seq_len, -1).transpose(1, 2),  # [batch_size, dim, seq_len]
+                    )
+                    / scale_factor
+                )
+
+                attn_scores.append(attn.unsqueeze(1))  # Add head dimension
+
+            # Stack along head dimension
+            self.attention_scores = torch.cat(
+                attn_scores, dim=1
+            )  # [batch_size, n_heads, seq_len, seq_len]
+
+        # Flash attention for speed
+        x = flash_attn_varlen_qkvpacked_func(
+            qkv, cu_seqlens, seq_len, 0.0, causal=False
+        )
+
+        x = rearrange(x, "(b s) h d -> b s (h d)", b=batch_size)
+
+        # ===== EXACT SAME RESIDUAL AND MLP AS ORIGINAL =====
+        x = bias_dropout_scale_fn(
+            self.attn_out(x), None, gate_msa, x_skip, self.dropout
+        )
+
+        # MLP block (exact same as original)
+        x = bias_dropout_scale_fn(
+            self.mlp(modulate_fused(self.norm2(x), shift_mlp, scale_mlp)),
+            None,
+            gate_mlp,
+            x,
+            self.dropout,
+        )
+
+        # Note: concept_attended_features are computed for analysis but don't affect the main generation path
+        # They could be used for additional conditioning or analysis in future versions
+
+        return x
 
 
 class DDiTBlock(nn.Module):
@@ -441,12 +694,24 @@ class SEDD(nn.Module):
         # Flag to enable attention score collection
         self.save_attention = False
         self.attention_layer_idx = -1  # Default to last layer
-        
+
         # PCA-based feature extraction flags
         self.save_pca_features = False
         self.layer_hidden_states = []  # Store intermediate layer outputs
         self.pca_components = 5  # Number of PCA components to keep
         self.pca_models = {}  # Store fitted PCA models for each position
+
+        # Concept attention flags and storage
+        self.save_concept_attention = False
+        self.concept_attention_layers = []  # Which layers to apply concept attention
+        self.concept_attention_storage = {}  # Store concept attention maps
+        self.cell_type_names = {
+            0: "Endothelial",
+            1: "Fibroblast",
+            2: "Smooth_Muscle",
+            3: "Ventricular_Cardiomyocyte",
+            4: "Atrial_Cardiomyocyte"
+        }
 
     def _get_bias_dropout_scale(self):
         return (
@@ -564,6 +829,237 @@ class SEDD(nn.Module):
             return self.compute_pca_scores()
         return None
 
+    def enable_concept_attention(self, enable=True, layers=None):
+        """
+        Enable or disable concept attention for specified layers.
+
+        Args:
+            enable: Whether to enable concept attention
+            layers: List of layer indices to replace with concept attention blocks.
+                   If None, uses default layers [15, 16, 17, 18]
+        """
+        self.save_concept_attention = enable
+
+        if layers is not None:
+            self.concept_attention_layers = layers
+        elif not self.concept_attention_layers:
+            # Default to last few layers
+            total_layers = len(self.blocks)
+            self.concept_attention_layers = list(range(max(0, total_layers-4), total_layers))
+
+        if enable:
+            self._replace_blocks_with_concept_attention()
+        else:
+            # Clear concept attention storage
+            self.concept_attention_storage = {}
+
+    def _replace_blocks_with_concept_attention(self):
+        """Replace specified DDiTBlocks with CellTypeConceptDDiTBlocks"""
+        replaced_count = 0
+
+        for layer_idx in self.concept_attention_layers:
+            if layer_idx < len(self.blocks):
+                original_block = self.blocks[layer_idx]
+
+                # Check if it's a DDiTBlock and not already a concept block
+                if (hasattr(original_block, 'norm1') and
+                    hasattr(original_block, 'n_heads') and
+                    not isinstance(original_block, CellTypeConceptDDiTBlock)):
+
+                    # Create concept attention block with same parameters
+                    concept_block = CellTypeConceptDDiTBlock(
+                        dim=original_block.norm1.dim,
+                        n_heads=original_block.n_heads,
+                        cond_dim=original_block.adaLN_modulation.in_features,
+                        mlp_ratio=4,
+                        dropout=original_block.dropout,
+                        num_cell_types=5,
+                        concept_attention_layers=self.concept_attention_layers
+                    ).to(next(original_block.parameters()).device)
+
+                    # Copy weights from original block
+                    self._copy_block_weights(original_block, concept_block)
+
+                    # Replace the block
+                    self.blocks[layer_idx] = concept_block
+                    replaced_count += 1
+
+        print(f"✅ Replaced {replaced_count} blocks with ConceptAttention")
+
+    def _copy_block_weights(self, original_block, concept_block):
+        """Copy weights from original DDiTBlock to CellTypeConceptDDiTBlock"""
+        try:
+            # Copy standard attention weights
+            concept_block.norm1.weight.data = original_block.norm1.weight.data.clone()
+            concept_block.attn_qkv.weight.data = original_block.attn_qkv.weight.data.clone()
+            concept_block.attn_out.weight.data = original_block.attn_out.weight.data.clone()
+
+            # Copy MLP weights
+            concept_block.norm2.weight.data = original_block.norm2.weight.data.clone()
+            concept_block.mlp[0].weight.data = original_block.mlp[0].weight.data.clone()
+            concept_block.mlp[0].bias.data = original_block.mlp[0].bias.data.clone()
+            concept_block.mlp[2].weight.data = original_block.mlp[2].weight.data.clone()
+            concept_block.mlp[2].bias.data = original_block.mlp[2].bias.data.clone()
+
+            # Copy AdaLN modulation weights
+            concept_block.adaLN_modulation.weight.data = original_block.adaLN_modulation.weight.data.clone()
+            concept_block.adaLN_modulation.bias.data = original_block.adaLN_modulation.bias.data.clone()
+
+            # Initialize concept projection layers with small random values
+            nn.init.xavier_uniform_(concept_block.dna_proj_k.weight, gain=0.1)
+            nn.init.xavier_uniform_(concept_block.dna_proj_v.weight, gain=0.1)
+            nn.init.xavier_uniform_(concept_block.concept_proj_q.weight, gain=0.1)
+            nn.init.xavier_uniform_(concept_block.concept_out_proj.weight, gain=0.1)
+
+        except Exception as e:
+            print(f"⚠️ Warning: Could not copy all weights: {e}")
+
+    def _create_concept_embeddings(self, expressions: torch.Tensor) -> torch.Tensor:
+        """Create cell type concept embeddings from expression data"""
+        batch_size = expressions.shape[0]
+
+        # Get model's hidden dimension from the first block
+        model_dim = self.blocks[0].norm1.dim
+
+        # Create concept embeddings for each cell type in the batch
+        concept_embeddings = []
+
+        # For each sample in batch, create embeddings for all 5 cell types
+        for i in range(batch_size):
+            sample_concepts = []
+
+            # Create embeddings for all 5 cell types as concepts
+            for cell_type_idx in range(5):
+                embed = self.label_embed(torch.tensor([cell_type_idx], device=expressions.device), train=False)
+                embed = embed.squeeze(0)  # Remove batch dimension
+
+                # Project to model dimension if needed
+                if embed.shape[-1] != model_dim:
+                    # Create a simple linear projection
+                    if not hasattr(self, '_concept_projection'):
+                        self._concept_projection = nn.Linear(embed.shape[-1], model_dim).to(expressions.device)
+                    embed = self._concept_projection(embed)
+
+                sample_concepts.append(embed)
+
+            # Stack concepts for this sample: [5, model_dim]
+            sample_concept_stack = torch.stack(sample_concepts, dim=0)
+            concept_embeddings.append(sample_concept_stack)
+
+        # Stack all samples: [batch, 5, model_dim]
+        cell_type_concepts = torch.stack(concept_embeddings, dim=0)
+
+        return cell_type_concepts
+
+    def _enable_concept_forward(self, cell_type_concepts: torch.Tensor):
+        """Modify model blocks to use ConceptAttention during forward pass"""
+
+        # Store concept embeddings directly in each ConceptAttention block as attributes
+        for layer_idx, block in enumerate(self.blocks):
+            if isinstance(block, CellTypeConceptDDiTBlock):
+                # Set concept embeddings and layer index as attributes
+                block.default_cell_type_concepts = cell_type_concepts
+                block.default_layer_idx = layer_idx
+
+    def get_concept_attention_scores(self):
+        """Get concept attention scores from all ConceptAttention blocks"""
+        concept_attention_maps = {}
+
+        for layer_idx, block in enumerate(self.blocks):
+            if isinstance(block, CellTypeConceptDDiTBlock):
+                block_attention = block.get_concept_attention()
+                if block_attention:
+                    concept_attention_maps[f'layer_{layer_idx}'] = block_attention
+
+        return concept_attention_maps
+
+    def extract_concept_attention_for_sequence(self, concept_attention_maps: Dict[str, Any],
+                                              seq_idx: int, target_cell_type: str,
+                                              attention_type: str = 'specific') -> Dict[str, List[float]]:
+        """Extract ConceptAttention scores for a specific sequence
+
+        Args:
+            concept_attention_maps: Attention maps from model
+            seq_idx: Index of sequence in batch
+            target_cell_type: Target cell type name
+            attention_type: 'specific' for target cell type only, 'all' for all 5 cell types
+
+        Returns:
+            Dict with cell type names as keys and attention scores as values
+        """
+
+        # Map cell type name to concept index
+        cell_type_to_idx = {
+            "atrial_cardiomyocyte": 4,
+            "endothelial": 0,
+            "fibroblast": 1,
+            "smooth_muscle": 2,
+            "ventricular_cardiomyocyte": 3
+        }
+
+        idx_to_cell_type = {v: k for k, v in cell_type_to_idx.items()}
+
+        target_concept_idx = cell_type_to_idx.get(target_cell_type.lower())
+        if target_concept_idx is None:
+            print(f"⚠️ Unknown cell type: {target_cell_type}")
+            return {}
+
+        # Input validation and conversion
+        if not concept_attention_maps:
+            print(f"⚠️ No concept attention maps provided")
+            return {}
+
+        # Handle both dict and list inputs
+        if isinstance(concept_attention_maps, list):
+            # If it's a list, it might be a list of concept attention dicts from different steps
+            # Try to find the last non-empty dict in the list
+            for item in reversed(concept_attention_maps):
+                if isinstance(item, dict) and item:
+                    concept_attention_maps = item
+                    break
+            else:
+                # No valid dict found in list, return empty result silently
+                return {}
+        elif not isinstance(concept_attention_maps, dict):
+            print(f"⚠️ Expected concept_attention_maps to be dict or list, got {type(concept_attention_maps)}")
+            return {}
+
+        # Find the last layer's attention data (should be the most informative)
+        for layer_name, attention_data in reversed(list(concept_attention_maps.items())):
+            if "concept_attention_weights" in attention_data:
+                # Updated attention shape: [batch, heads, num_concepts, seq_len]
+                # (concept queries attending to DNA keys)
+                weights = attention_data["concept_attention_weights"]
+                if seq_idx >= weights.shape[0]:
+                    print(f"⚠️ Sequence index {seq_idx} out of range for batch size {weights.shape[0]}")
+                    continue
+
+                result = {}
+
+                if attention_type == 'specific':
+                    # Extract attention for target cell type only: [heads, target_concept, seq_len]
+                    target_weights = weights[seq_idx, :, target_concept_idx, :]  # [heads, seq_len]
+                    # Average over heads to get [seq_len] attention scores for target cell type
+                    seq_weights = target_weights.mean(dim=0)  # [seq_len]
+                    result[target_cell_type.lower()] = seq_weights.numpy().tolist()
+
+                elif attention_type == 'all':
+                    # Extract attention for all 5 cell types
+                    for concept_idx in range(5):
+                        cell_type_name = idx_to_cell_type[concept_idx]
+                        concept_weights = weights[seq_idx, :, concept_idx, :]  # [heads, seq_len]
+                        # Average over heads to get [seq_len] attention scores
+                        seq_weights = concept_weights.mean(dim=0)  # [seq_len]
+                        result[cell_type_name] = seq_weights.numpy().tolist()
+
+                else:
+                    print(f"⚠️ Unknown attention_type: {attention_type}. Use 'specific' or 'all'")
+                    return {}
+
+                return result
+
+        return {}  # Return empty dict if no attention found
+
     def get_attention_scores(self):
         """Get attention scores from the specified block."""
         # Determine which block to get scores from
@@ -606,10 +1102,26 @@ class SEDD(nn.Module):
         if self.save_pca_features:
             self.layer_hidden_states = []
 
+        # Clear concept attention storage
+        if self.save_concept_attention:
+            self.concept_attention_storage = {}
+
+        # Create concept embeddings if concept attention is enabled
+        cell_type_concepts = None
+        if self.save_concept_attention:
+            cell_type_concepts = self._create_concept_embeddings(labels)
+            self._enable_concept_forward(cell_type_concepts)
+
         with torch.cuda.amp.autocast(dtype=torch.bfloat16):
             for i in range(len(self.blocks)):
-                x = self.blocks[i](x, rotary_cos_sin, c, seqlens=None)
-                
+                # Check if this is a concept attention block
+                if isinstance(self.blocks[i], CellTypeConceptDDiTBlock):
+                    x = self.blocks[i](x, rotary_cos_sin, c,
+                                     cell_type_concepts=cell_type_concepts,
+                                     layer_idx=i, seqlens=None)
+                else:
+                    x = self.blocks[i](x, rotary_cos_sin, c, seqlens=None)
+
                 # Store layer output for PCA analysis
                 if self.save_pca_features:
                     # Convert to float32 and detach for PCA computation
@@ -618,6 +1130,10 @@ class SEDD(nn.Module):
             x = self.output_layer(x, c)
 
         x = torch.scatter(x, -1, indices[..., None], torch.zeros_like(x[..., :1]))
+
+        # Collect concept attention from all concept blocks
+        if self.save_concept_attention:
+            self.concept_attention_storage = self.get_concept_attention_scores()
         # ---------------------------------------------#
 
         # Comment out the above section and uncomment below for convolution based networks
@@ -641,9 +1157,18 @@ class SEDD(nn.Module):
 
         # ---------------------------------------------#
 
-        if self.save_attention:
+        if self.save_attention and self.save_concept_attention:
+            # Return output, attention scores, and concept attention
+            attention_scores = self.get_attention_scores()
+            concept_attention = self.concept_attention_storage
+            return x, attention_scores, concept_attention
+        elif self.save_attention:
             # Return both output and attention scores
             attention_scores = self.get_attention_scores()
             return x, attention_scores
+        elif self.save_concept_attention:
+            # Return output and concept attention
+            concept_attention = self.concept_attention_storage
+            return x, concept_attention
         else:
             return x

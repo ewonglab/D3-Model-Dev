@@ -155,6 +155,7 @@ def get_pc_sampler(
     attention_layer_idx=None,
     save_pca_features=False,
     pca_components=5,
+    save_concept_attention=False,
 ):
     predictor = get_predictor(predictor)(graph, noise)
     projector = proj_fun
@@ -172,14 +173,21 @@ def get_pc_sampler(
         if save_pca_features and hasattr(model, "enable_pca_features"):
             model.enable_pca_features(True, n_components=pca_components)
 
+        # Enable concept attention if requested
+        if save_concept_attention and hasattr(model, "enable_concept_attention"):
+            # Concept attention is already enabled via the model setup in run_sample.py
+            # We just need to ensure the save flag is set
+            model.save_concept_attention = True
+
         sampling_score_fn = mutils.get_score_fn(model, train=False, sampling=True)
         x = graph.sample_limit(*batch_dims).to(device)
         timesteps = torch.linspace(1, eps, steps + 1, device=device)
         dt = (1 - eps) / steps
 
-        # To store attention scores and PCA features from final step only
+        # To store attention scores, PCA features, and concept attention from final step only
         all_attention_scores = [] if save_attention else None
         all_pca_scores = [] if save_pca_features else None
+        all_concept_attention = [] if save_concept_attention else None
 
         # Set random seed for this batch if provided
         if current_seed is not None:
@@ -236,19 +244,35 @@ def get_pc_sampler(
             if pca_scores is not None:
                 all_pca_scores.append(pca_scores)
 
-        # Disable attention scoring and PCA collection to save memory
+        # Get concept attention after sampling is complete
+        if save_concept_attention and hasattr(model, "concept_attention_storage"):
+            concept_attention = model.concept_attention_storage
+            if concept_attention:
+                all_concept_attention.append(concept_attention)
+
+        # Disable attention scoring, PCA collection, and concept attention to save memory
         if save_attention and hasattr(model, "enable_attention_scoring"):
             model.enable_attention_scoring(False)
         if save_pca_features and hasattr(model, "enable_pca_features"):
             model.enable_pca_features(False)
+        if save_concept_attention and hasattr(model, "enable_concept_attention"):
+            model.save_concept_attention = False
 
         # Return generated sequence and any extracted features
-        if save_attention and save_pca_features:
+        if save_attention and save_pca_features and save_concept_attention:
+            return x, all_attention_scores, all_pca_scores, all_concept_attention
+        elif save_attention and save_pca_features:
             return x, all_attention_scores, all_pca_scores
+        elif save_attention and save_concept_attention:
+            return x, all_attention_scores, all_concept_attention
+        elif save_pca_features and save_concept_attention:
+            return x, all_pca_scores, all_concept_attention
         elif save_attention:
             return x, all_attention_scores
         elif save_pca_features:
             return x, all_pca_scores
+        elif save_concept_attention:
+            return x, all_concept_attention
         else:
             return x
 

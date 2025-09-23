@@ -89,6 +89,24 @@ def main():
         default=5,
         help="Number of PCA components to extract (default: 5)",
     )
+    parser.add_argument(
+        "--save_concept_attention",
+        action="store_true",
+        help="Enable concept attention analysis during sampling",
+    )
+    parser.add_argument(
+        "--concept_attention_layers",
+        type=str,
+        default=None,
+        help="Comma-separated list of layer indices for concept attention (e.g., '8, 9,10,11'). Default is last 4 layers.",
+    )
+    parser.add_argument(
+        "--concept_attention_type",
+        type=str,
+        default="specific",
+        choices=["specific", "all"],
+        help="Type of concept attention to save: 'specific' for target cell type only, 'all' for all cell types (default: specific)",
+    )
     args = parser.parse_args()
 
     # Load random seeds if provided
@@ -106,6 +124,22 @@ def main():
     device = torch.device("cuda")
     model, graph, noise = load_model_local(args.model_path, device)
 
+    # Enable concept attention if requested
+    if args.save_concept_attention:
+        concept_layers = None
+        if args.concept_attention_layers:
+            try:
+                concept_layers = [int(x.strip()) for x in args.concept_attention_layers.split(',')]
+                print(f"Using concept attention layers: {concept_layers}")
+            except ValueError:
+                print(f"Warning: Invalid concept attention layers format. Using default.")
+                concept_layers = None
+
+        model.enable_concept_attention(True, layers=concept_layers)
+        print(f"🧬 Concept attention enabled with type: {args.concept_attention_type}")
+    else:
+        model.enable_concept_attention(False)
+
     # Load data and prepare dataset
     filepath = args.input_data
     if not os.path.exists(filepath):
@@ -117,9 +151,18 @@ def main():
     y_test = torch.tensor(np.array(data["y_test"]).astype(np.float32))
     seq_length = X_test.shape[2]  # Get sequence length from data
     X_test = torch.argmax(X_test, dim=1)
+
+    # Adjust batch size to dataset size if dataset is smaller
+    dataset_size = X_test.shape[0]
+    effective_batch_size = min(args.batch_size, dataset_size)
+
+    print(f"Dataset size: {dataset_size}, Requested batch size: {args.batch_size}")
+    if effective_batch_size < args.batch_size:
+        print(f"Adjusting batch size to {effective_batch_size} to match dataset size")
+
     testing_ds = TensorDataset(X_test, y_test)
     test_ds = torch.utils.data.DataLoader(
-        testing_ds, batch_size=args.batch_size, shuffle=False, num_workers=4
+        testing_ds, batch_size=effective_batch_size, shuffle=False, num_workers=4
     )
 
     # Initialize sampling function with batch_size
@@ -127,12 +170,13 @@ def main():
     val_labels = []  # To store cell type labels
     all_attention_scores = []  # To store attention scores if enabled
     all_pca_scores = [] if args.save_pca_features else None  # To store PCA scores if enabled
+    all_concept_attention = [] if args.save_concept_attention else None  # To store concept attention if enabled
 
     # Initial sampling_fn creation
     sampling_fn = sampling.get_pc_sampler(
         graph,
         noise,
-        (args.batch_size, seq_length),
+        (effective_batch_size, seq_length),
         "analytic",
         args.steps,
         device=device,
@@ -140,6 +184,7 @@ def main():
         attention_layer_idx=args.attention_layer,
         save_pca_features=args.save_pca_features,
         pca_components=args.pca_components,
+        save_concept_attention=args.save_concept_attention,
     )
 
     # Create generated_results directory if it doesn't exist
@@ -156,7 +201,7 @@ def main():
             current_seed_for_this_batch = random_seeds[seed_idx]
             print(f"Using seed {current_seed_for_this_batch} for batch {batch_idx}")
 
-        if batch.shape[0] != args.batch_size:
+        if batch.shape[0] != effective_batch_size:
             # Recreate sampling_fn if batch size changes
             sampling_fn = sampling.get_pc_sampler(
                 graph,
@@ -169,21 +214,39 @@ def main():
                 attention_layer_idx=args.attention_layer,
                 save_pca_features=args.save_pca_features,
                 pca_components=args.pca_components,
+                save_concept_attention=args.save_concept_attention,
             )
 
         # Handle different return types from the sampling function
         result = sampling_fn(model, val_target.to(device), current_seed=current_seed_for_this_batch)
 
-        if args.save_attention and args.save_pca_features:
+        # Handle multiple return types based on enabled features
+        if args.save_attention and args.save_pca_features and args.save_concept_attention:
+            sample, batch_attention_scores, batch_pca_scores, batch_concept_attention = result
+            all_attention_scores.append(batch_attention_scores)
+            all_pca_scores.append(batch_pca_scores)
+            all_concept_attention.append(batch_concept_attention)
+        elif args.save_attention and args.save_pca_features:
             sample, batch_attention_scores, batch_pca_scores = result
             all_attention_scores.append(batch_attention_scores)
             all_pca_scores.append(batch_pca_scores)
+        elif args.save_attention and args.save_concept_attention:
+            sample, batch_attention_scores, batch_concept_attention = result
+            all_attention_scores.append(batch_attention_scores)
+            all_concept_attention.append(batch_concept_attention)
+        elif args.save_pca_features and args.save_concept_attention:
+            sample, batch_pca_scores, batch_concept_attention = result
+            all_pca_scores.append(batch_pca_scores)
+            all_concept_attention.append(batch_concept_attention)
         elif args.save_attention:
             sample, batch_attention_scores = result
             all_attention_scores.append(batch_attention_scores)
         elif args.save_pca_features:
             sample, batch_pca_scores = result
             all_pca_scores.append(batch_pca_scores)
+        elif args.save_concept_attention:
+            sample, batch_concept_attention = result
+            all_concept_attention.append(batch_concept_attention)
         else:
             sample = result
 
@@ -198,6 +261,7 @@ def main():
     cell_type_groups = {}
     cell_type_attention_groups = {}
     cell_type_pca_groups = {}
+    cell_type_concept_attention_groups = {}
 
     for i, label_vector in enumerate(val_labels_all):
         cell_type = get_cell_type_from_label(label_vector)
@@ -208,22 +272,37 @@ def main():
                 cell_type_attention_groups[cell_type] = []
             if args.save_pca_features and all_pca_scores:
                 cell_type_pca_groups[cell_type] = []
+            if args.save_concept_attention and all_concept_attention:
+                cell_type_concept_attention_groups[cell_type] = []
 
         cell_type_groups[cell_type].append(val_pred_seqs[i])
 
         # Group attention scores by cell type if available
         if args.save_attention and all_attention_scores:
             # Find which batch this sequence belongs to
-            batch_idx = i // args.batch_size
+            batch_idx = i // effective_batch_size
             if batch_idx < len(all_attention_scores):
                 cell_type_attention_groups[cell_type].append(all_attention_scores[batch_idx])
 
         # Group PCA scores by cell type if available
         if args.save_pca_features and all_pca_scores:
             # Find which batch this sequence belongs to
-            batch_idx = i // args.batch_size
+            batch_idx = i // effective_batch_size
             if batch_idx < len(all_pca_scores):
                 cell_type_pca_groups[cell_type].append(all_pca_scores[batch_idx])
+
+        # Group concept attention by cell type if available
+        if args.save_concept_attention and all_concept_attention:
+            # Find which batch this sequence belongs to
+            batch_idx = i // effective_batch_size
+            if batch_idx < len(all_concept_attention):
+                # Store the global sequence index and batch data for proper mapping later
+                cell_type_concept_attention_groups[cell_type].append({
+                    'global_seq_idx': i,
+                    'global_batch_idx': batch_idx,
+                    'within_batch_idx': i % effective_batch_size,
+                    'concept_data': all_concept_attention[batch_idx]
+                })
 
     # Save sequences for each cell type separately
     for cell_type, sequences in cell_type_groups.items():
@@ -275,6 +354,52 @@ def main():
             print(f"Saving {cell_type} PCA features to {pca_path}...")
             torch.save(cell_type_pca_groups[cell_type], pca_path)
 
+        # Save concept attention if enabled
+        if args.save_concept_attention and cell_type in cell_type_concept_attention_groups:
+            concept_file = f"concept_attention_{cell_type}.pt"
+            concept_path = os.path.join(results_dir, concept_file)
+
+            # Extract just the concept data for saving
+            concept_data = [entry['concept_data'] for entry in cell_type_concept_attention_groups[cell_type]]
+            print(f"Saving {cell_type} concept attention to {concept_path}...")
+            torch.save(concept_data, concept_path)
+
+            # Also save a detailed analysis file with extracted attention scores
+            if cell_type_concept_attention_groups[cell_type]:
+                concept_analysis_file = f"concept_attention_analysis_{cell_type}.json"
+                concept_analysis_path = os.path.join(results_dir, concept_analysis_file)
+
+                analysis_data = []
+                for seq_idx, dna_seq in enumerate(dna_sequences):
+                    # Find the corresponding concept attention data for this sequence
+                    # Each entry in the concept attention group corresponds to this sequence
+                    if seq_idx < len(cell_type_concept_attention_groups[cell_type]):
+                        entry = cell_type_concept_attention_groups[cell_type][seq_idx]
+                        concept_maps = entry['concept_data']
+                        within_batch_idx = entry['within_batch_idx']
+
+                        if concept_maps:
+                            seq_concept_scores = model.extract_concept_attention_for_sequence(
+                                concept_maps, within_batch_idx, cell_type, args.concept_attention_type
+                            )
+
+                            # Only add to analysis if we got valid concept scores
+                            if seq_concept_scores:
+                                analysis_data.append({
+                                    'sequence_id': f"{cell_type}_seq_{seq_idx:04d}",
+                                    'cell_type': cell_type,
+                                    'sequence': dna_seq,
+                                    'concept_attention_scores': seq_concept_scores,
+                                    'attention_type': args.concept_attention_type
+                                })
+
+                if analysis_data:
+                    import json
+                    with open(concept_analysis_path, 'w') as f:
+                        json.dump(analysis_data, f, indent=2)
+                    print(f"Saving {cell_type} concept attention analysis to {concept_analysis_path}...")
+                    print(f"  Analyzed {len(analysis_data)} sequences with concept attention type: {args.concept_attention_type}")
+
     # Print summary
     print(f"\nSummary:")
     for cell_type, sequences in cell_type_groups.items():
@@ -288,6 +413,14 @@ def main():
 
     if args.save_pca_features:
         print(f"PCA features saved with {args.pca_components} components per position")
+
+    if args.save_concept_attention:
+        layers_used = args.concept_attention_layers if args.concept_attention_layers else "default (last 4)"
+        print(f"Concept attention saved from layers: {layers_used}")
+        print(f"Concept attention type: {args.concept_attention_type}")
+        print(f"Output includes:")
+        print(f"  - concept_attention_{{cell_type}}.pt: Raw attention maps")
+        print(f"  - concept_attention_analysis_{{cell_type}}.json: Processed attention scores per sequence")
 
 
 if __name__ == "__main__":
