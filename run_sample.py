@@ -23,6 +23,19 @@ def one_hot_to_seq(one_hot):
     return "".join([nucleotides[idx] for idx in indices])
 
 
+def get_cell_type_from_label(label_vector):
+    """Convert one-hot encoded cell type label back to cell type name."""
+    cell_types = [
+        "Endothelial",
+        "Fibroblast",
+        "Smooth_Muscle",
+        "Ventricular_Cardiomyocyte",
+        "Atrial_Cardiomyocyte",
+    ]
+    idx = torch.argmax(label_vector).item()
+    return cell_types[idx]
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Generate samples from a specified dataset"
@@ -37,10 +50,10 @@ def main():
         help="Path to the input .h5 dataset file",
     )
     parser.add_argument(
-        "--batch_size", type=int, default=256, help="Batch size for processing"
+        "--batch_size", type=int, default=500, help="Batch size for processing"
     )
     parser.add_argument(
-        "--steps", type=int, default=249, help="Number of sampling steps"
+        "--steps", type=int, default=200, help="Number of sampling steps"
     )
     parser.add_argument(
         "--results_dir",
@@ -105,6 +118,7 @@ def main():
 
     # Initialize sampling function with batch_size
     val_pred_seq = []
+    val_labels = []  # To store cell type labels
     all_attention_scores = []  # To store attention scores if enabled
 
     # Parse which steps to save attention for
@@ -174,66 +188,82 @@ def main():
 
         seq_pred_one_hot = F.one_hot(sample, num_classes=4).float()
         val_pred_seq.append(seq_pred_one_hot)
+        val_labels.append(val_target)
 
     val_pred_seqs = torch.cat(val_pred_seq, dim=0)
+    val_labels_all = torch.cat(val_labels, dim=0)
 
-    # Create output filenames based on input dataset name
-    input_name = os.path.splitext(os.path.basename(args.input_data))[0]
-    npz_file = f"sample_{input_name}.npz"
-    npz_path = os.path.join(results_dir, npz_file)
+    # Group sequences by cell type
+    cell_type_groups = {}
+    cell_type_attention_groups = {}
 
-    # Extract cell type from filename
-    cell_type = None
-    if "_" in input_name:
-        parts = input_name.split("_")
-        if len(parts) >= 1:
-            cell_type = parts[0]  # Assumes format like "endothelial_test_10k"
+    for i, label_vector in enumerate(val_labels_all):
+        cell_type = get_cell_type_from_label(label_vector)
 
-    # If cell_type extraction failed, use the whole input_name
-    if not cell_type:
-        cell_type = input_name
+        if cell_type not in cell_type_groups:
+            cell_type_groups[cell_type] = []
+            if args.save_attention and all_attention_scores:
+                cell_type_attention_groups[cell_type] = []
 
-    txt_file = f"final_{cell_type}.txt"
-    txt_path = os.path.join(results_dir, txt_file)
+        cell_type_groups[cell_type].append(val_pred_seqs[i])
 
-    # Save the generated sequences as NPZ
-    np.savez(
-        npz_path,
-        val_pred_seqs.cpu(),
-    )
-    print(f"Generated sequences saved to {npz_path}")
+        # Group attention scores by cell type if available
+        if args.save_attention and all_attention_scores:
+            # Find which batch this sequence belongs to
+            batch_idx = i // args.batch_size
+            if batch_idx < len(all_attention_scores):
+                cell_type_attention_groups[cell_type].append(all_attention_scores[batch_idx])
 
-    # Convert one-hot sequences to DNA sequences and save as text
-    print("Converting to DNA sequences...")
-    dna_sequences = []
-    for seq in val_pred_seqs.cpu().numpy():
-        dna_seq = one_hot_to_seq(seq)
-        dna_sequences.append(dna_seq)
+    # Save sequences for each cell type separately
+    for cell_type, sequences in cell_type_groups.items():
+        sequences_tensor = torch.stack(sequences)
 
-    # Save DNA sequences to text file
-    print(f"Saving DNA sequences to {txt_path}...")
-    with open(txt_path, "w") as f:
-        for seq in dna_sequences:
-            f.write(f"{seq}\n")
+        # Create output filenames using cell type
+        npz_file = f"sample_{cell_type}.npz"
+        npz_path = os.path.join(results_dir, npz_file)
+        txt_file = f"final_{cell_type}.txt"
+        txt_path = os.path.join(results_dir, txt_file)
 
-    print(f"Successfully saved {len(dna_sequences)} DNA sequences to {txt_path}")
-    print(f"First few sequences:")
-    for i in range(min(3, len(dna_sequences))):
-        print(f"  Sequence {i+1}: {dna_sequences[i][:50]}...")
+        # Save the generated sequences as NPZ
+        np.savez(
+            npz_path,
+            sequences_tensor.cpu().numpy(),
+        )
+        print(f"Generated {len(sequences)} sequences for {cell_type} saved to {npz_path}")
 
-    # Save attention scores if enabled
-    if args.save_attention and all_attention_scores:
-        attention_file = f"attention_{cell_type}.pt"
-        attention_path = os.path.join(results_dir, attention_file)
+        # Convert one-hot sequences to DNA sequences and save as text
+        print(f"Converting {cell_type} sequences to DNA...")
+        dna_sequences = []
+        for seq in sequences_tensor.cpu().numpy():
+            dna_seq = one_hot_to_seq(seq)
+            dna_sequences.append(dna_seq)
 
-        print(f"Saving attention scores to {attention_path}...")
-        torch.save(all_attention_scores, attention_path)
+        # Save DNA sequences to text file
+        print(f"Saving {cell_type} DNA sequences to {txt_path}...")
+        with open(txt_path, "w") as f:
+            for seq in dna_sequences:
+                f.write(f"{seq}\n")
 
-        # Print memory efficiency mode if active
+        print(f"Successfully saved {len(dna_sequences)} {cell_type} DNA sequences to {txt_path}")
+        if len(dna_sequences) > 0:
+            print(f"First {cell_type} sequence: {dna_sequences[0][:50]}...")
+
+        # Save attention scores if enabled
+        if args.save_attention and cell_type in cell_type_attention_groups:
+            attention_file = f"attention_{cell_type}.pt"
+            attention_path = os.path.join(results_dir, attention_file)
+
+            print(f"Saving {cell_type} attention scores to {attention_path}...")
+            torch.save(cell_type_attention_groups[cell_type], attention_path)
+
+    # Print summary
+    print(f"\nSummary:")
+    for cell_type, sequences in cell_type_groups.items():
+        print(f"  {cell_type}: {len(sequences)} sequences")
+
+    if args.save_attention:
         if args.memory_efficient:
-            print(
-                f"Saved attention scores in memory-efficient mode (last step, last layer only)"
-            )
+            print(f"Attention scores saved in memory-efficient mode (last step, last layer only)")
         else:
             print(f"Attention scores saved successfully!")
 
