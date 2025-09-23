@@ -152,6 +152,9 @@ def get_pc_sampler(
     device=torch.device("cpu"),
     proj_fun=lambda x: x,
     save_attention=False,
+    attention_layer_idx=None,
+    save_pca_features=False,
+    pca_components=5,
 ):
     predictor = get_predictor(predictor)(graph, noise)
     projector = proj_fun
@@ -163,15 +166,20 @@ def get_pc_sampler(
         # We'll enable it just before the final step to save memory
         if save_attention and hasattr(model, "enable_attention_scoring"):
             # Don't enable it at the start - we'll enable it only for the final step
-            model.enable_attention_scoring(False)
+            model.enable_attention_scoring(False, layer_idx=attention_layer_idx)
+
+        # Enable PCA feature extraction if requested
+        if save_pca_features and hasattr(model, "enable_pca_features"):
+            model.enable_pca_features(True, n_components=pca_components)
 
         sampling_score_fn = mutils.get_score_fn(model, train=False, sampling=True)
         x = graph.sample_limit(*batch_dims).to(device)
         timesteps = torch.linspace(1, eps, steps + 1, device=device)
         dt = (1 - eps) / steps
 
-        # To store attention scores from final step only
+        # To store attention scores and PCA features from final step only
         all_attention_scores = [] if save_attention else None
+        all_pca_scores = [] if save_pca_features else None
 
         # Set random seed for this batch if provided
         if current_seed is not None:
@@ -191,7 +199,7 @@ def get_pc_sampler(
                 and i == steps - 1
                 and hasattr(model, "enable_attention_scoring")
             ):
-                model.enable_attention_scoring(True)
+                model.enable_attention_scoring(True, layer_idx=attention_layer_idx)
 
             # Call the predictor update function
             x = predictor.update_fn(sampling_score_fn, x, labels, t, dt)
@@ -209,7 +217,7 @@ def get_pc_sampler(
         if denoise:
             # Enable attention scoring for final denoising step if needed
             if save_attention and hasattr(model, "enable_attention_scoring"):
-                model.enable_attention_scoring(True)
+                model.enable_attention_scoring(True, layer_idx=attention_layer_idx)
 
             # denoising step
             x = projector(x)
@@ -222,13 +230,25 @@ def get_pc_sampler(
                 if final_attention_scores:
                     all_attention_scores.append(("final", final_attention_scores))
 
-        # Disable attention scoring to save memory
+        # Get PCA scores after sampling is complete
+        if save_pca_features and hasattr(model, "get_pca_scores"):
+            pca_scores = model.get_pca_scores()
+            if pca_scores is not None:
+                all_pca_scores.append(pca_scores)
+
+        # Disable attention scoring and PCA collection to save memory
         if save_attention and hasattr(model, "enable_attention_scoring"):
             model.enable_attention_scoring(False)
+        if save_pca_features and hasattr(model, "enable_pca_features"):
+            model.enable_pca_features(False)
 
-        # Return both generated sequence and attention scores
-        if save_attention:
+        # Return generated sequence and any extracted features
+        if save_attention and save_pca_features:
+            return x, all_attention_scores, all_pca_scores
+        elif save_attention:
             return x, all_attention_scores
+        elif save_pca_features:
+            return x, all_pca_scores
         else:
             return x
 

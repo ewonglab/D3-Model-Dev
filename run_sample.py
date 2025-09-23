@@ -73,15 +73,21 @@ def main():
         help="Enable saving of attention scores during sampling",
     )
     parser.add_argument(
-        "--attention_steps",
-        type=str,
-        default="first,middle,last",
-        help="Which steps to save attention for (comma-separated list or 'all')",
+        "--attention_layer",
+        type=int,
+        default=None,
+        help="Specify which attention layer to extract scores from (0-indexed). Default is the last layer.",
     )
     parser.add_argument(
-        "--memory_efficient",
+        "--save_pca_features",
         action="store_true",
-        help="Use memory-efficient attention scoring (only last step, last layer, last head)",
+        help="Enable PCA-based feature extraction from transformer layers",
+    )
+    parser.add_argument(
+        "--pca_components",
+        type=int,
+        default=5,
+        help="Number of PCA components to extract (default: 5)",
     )
     args = parser.parse_args()
 
@@ -120,22 +126,7 @@ def main():
     val_pred_seq = []
     val_labels = []  # To store cell type labels
     all_attention_scores = []  # To store attention scores if enabled
-
-    # Parse which steps to save attention for
-    save_attention_steps = []
-    if args.save_attention:
-        if args.attention_steps == "all" and not args.memory_efficient:
-            save_attention_steps = "all"
-        else:
-            try:
-                step_names = args.attention_steps.split(",")
-                save_attention_steps = step_names
-            except:
-                print(
-                    f"Warning: Could not parse attention_steps: {args.attention_steps}"
-                )
-                print("Defaulting to first, middle, last steps")
-                save_attention_steps = ["first", "middle", "last"]
+    all_pca_scores = [] if args.save_pca_features else None  # To store PCA scores if enabled
 
     # Initial sampling_fn creation
     sampling_fn = sampling.get_pc_sampler(
@@ -146,6 +137,9 @@ def main():
         args.steps,
         device=device,
         save_attention=args.save_attention,
+        attention_layer_idx=args.attention_layer,
+        save_pca_features=args.save_pca_features,
+        pca_components=args.pca_components,
     )
 
     # Create generated_results directory if it doesn't exist
@@ -172,19 +166,26 @@ def main():
                 args.steps,
                 device=device,
                 save_attention=args.save_attention,
+                attention_layer_idx=args.attention_layer,
+                save_pca_features=args.save_pca_features,
+                pca_components=args.pca_components,
             )
 
-        # Pass the current_seed_for_this_batch to the sampling_fn call
-        if args.save_attention:
-            sample, batch_attention_scores = sampling_fn(
-                model, val_target.to(device), current_seed=current_seed_for_this_batch
-            )
-            # Store the attention scores for this batch
+        # Handle different return types from the sampling function
+        result = sampling_fn(model, val_target.to(device), current_seed=current_seed_for_this_batch)
+
+        if args.save_attention and args.save_pca_features:
+            sample, batch_attention_scores, batch_pca_scores = result
             all_attention_scores.append(batch_attention_scores)
+            all_pca_scores.append(batch_pca_scores)
+        elif args.save_attention:
+            sample, batch_attention_scores = result
+            all_attention_scores.append(batch_attention_scores)
+        elif args.save_pca_features:
+            sample, batch_pca_scores = result
+            all_pca_scores.append(batch_pca_scores)
         else:
-            sample = sampling_fn(
-                model, val_target.to(device), current_seed=current_seed_for_this_batch
-            )
+            sample = result
 
         seq_pred_one_hot = F.one_hot(sample, num_classes=4).float()
         val_pred_seq.append(seq_pred_one_hot)
@@ -196,6 +197,7 @@ def main():
     # Group sequences by cell type
     cell_type_groups = {}
     cell_type_attention_groups = {}
+    cell_type_pca_groups = {}
 
     for i, label_vector in enumerate(val_labels_all):
         cell_type = get_cell_type_from_label(label_vector)
@@ -204,6 +206,8 @@ def main():
             cell_type_groups[cell_type] = []
             if args.save_attention and all_attention_scores:
                 cell_type_attention_groups[cell_type] = []
+            if args.save_pca_features and all_pca_scores:
+                cell_type_pca_groups[cell_type] = []
 
         cell_type_groups[cell_type].append(val_pred_seqs[i])
 
@@ -213,6 +217,13 @@ def main():
             batch_idx = i // args.batch_size
             if batch_idx < len(all_attention_scores):
                 cell_type_attention_groups[cell_type].append(all_attention_scores[batch_idx])
+
+        # Group PCA scores by cell type if available
+        if args.save_pca_features and all_pca_scores:
+            # Find which batch this sequence belongs to
+            batch_idx = i // args.batch_size
+            if batch_idx < len(all_pca_scores):
+                cell_type_pca_groups[cell_type].append(all_pca_scores[batch_idx])
 
     # Save sequences for each cell type separately
     for cell_type, sequences in cell_type_groups.items():
@@ -256,16 +267,27 @@ def main():
             print(f"Saving {cell_type} attention scores to {attention_path}...")
             torch.save(cell_type_attention_groups[cell_type], attention_path)
 
+        # Save PCA scores if enabled
+        if args.save_pca_features and cell_type in cell_type_pca_groups:
+            pca_file = f"pca_features_{cell_type}.pt"
+            pca_path = os.path.join(results_dir, pca_file)
+
+            print(f"Saving {cell_type} PCA features to {pca_path}...")
+            torch.save(cell_type_pca_groups[cell_type], pca_path)
+
     # Print summary
     print(f"\nSummary:")
     for cell_type, sequences in cell_type_groups.items():
         print(f"  {cell_type}: {len(sequences)} sequences")
 
     if args.save_attention:
-        if args.memory_efficient:
-            print(f"Attention scores saved in memory-efficient mode (last step, last layer only)")
+        if args.attention_layer is not None:
+            print(f"Attention scores saved from layer {args.attention_layer}")
         else:
-            print(f"Attention scores saved successfully!")
+            print(f"Attention scores saved from the last layer")
+
+    if args.save_pca_features:
+        print(f"PCA features saved with {args.pca_components} components per position")
 
 
 if __name__ == "__main__":
