@@ -5,3 +5,5 @@ exp_local/*
 # Ignore python cache
 __pycache__/
 *.py[cod]
+model_results/
+outputs/
