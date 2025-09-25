@@ -1,14 +1,34 @@
 ## ⚡ Quick Start
 
 ### Installation
+
+#### Local Development Setup
 ```bash
 # Clone repository
 git clone https://github.com/ewonglab/D3-Model-Dev
 cd D3-Model-Dev
 
-# Install in development mode (recommended)
-pip install -e .
+# Create conda environment with Python 3.10
+conda create -n d3 python=3.10 -y
+conda activate d3
+
+# Run local setup script
+bash setup-local.sh
 ```
+
+#### Katana Cluster Setup
+For running on Katana cluster:
+
+1. Update the conda path in `setup-katana.sh`:
+   ```bash
+   # Replace this line with your own conda path:
+   source /srv/scratch/YOUR_USERNAME/miniconda3/bin/activate
+   ```
+
+2. Submit the job:
+   ```bash
+   qsub setup-katana.sh
+   ```
 
 ## Development Commands
 
