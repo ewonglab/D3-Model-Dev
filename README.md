@@ -148,10 +148,40 @@ python run_sample.py \
 
 **Output**: `pca_features_{cell_type}.pt` files containing PCA scores for each cell type
 
-#### Combined Analysis
-Extract both attention scores and PCA features simultaneously:
+#### Concept Attention Analysis
+Extract concept-level attention scores to understand how the model attends to cell type embeddings during generation:
 
 ```bash
+# Save concept attention with default settings (last 4 layers, target cell type only)
+python run_sample.py \
+    --model_path path/to/model.pth \
+    --input_data data/test_data.h5 \
+    --save_concept_attention
+
+# Specify custom layers for concept attention extraction
+python run_sample.py \
+    --model_path path/to/model.pth \
+    --input_data data/test_data.h5 \
+    --save_concept_attention \
+    --concept_attention_layers "8,9,10,11"
+
+# Save attention to all cell types (not just target)
+python run_sample.py \
+    --model_path path/to/model.pth \
+    --input_data data/test_data.h5 \
+    --save_concept_attention \
+    --concept_attention_type all
+```
+
+**Output**:
+- `concept_attention_{cell_type}.pt` files containing raw attention maps
+- `concept_attention_analysis_{cell_type}.json` files with processed attention scores per sequence
+
+#### Combined Analysis
+Extract attention scores, PCA features, and concept attention simultaneously:
+
+```bash
+# Combine attention and PCA
 python run_sample.py \
     --model_path path/to/model.pth \
     --input_data data/test_data.h5 \
@@ -159,6 +189,17 @@ python run_sample.py \
     --attention_layer 10 \
     --save_pca_features \
     --pca_components 8 \
+    --batch_size 128 \
+    --steps 250
+
+# Combine all three analysis methods
+python run_sample.py \
+    --model_path path/to/model.pth \
+    --input_data data/test_data.h5 \
+    --save_attention \
+    --save_pca_features \
+    --save_concept_attention \
+    --concept_attention_layers "8,9,10,11" \
     --batch_size 128 \
     --steps 250
 ```
@@ -188,10 +229,12 @@ python run_sample.py \
 Generated results are organized by cell type with the following structure:
 ```
 results_dir/
-├── sample_Endothelial.npz           # One-hot encoded sequences
-├── final_Endothelial.txt            # DNA sequences as text
-├── attention_Endothelial.pt         # Attention matrices (if enabled)
-├── pca_features_Endothelial.pt      # PCA scores (if enabled)
+├── sample_Endothelial.npz                        # One-hot encoded sequences
+├── final_Endothelial.txt                         # DNA sequences as text
+├── attention_Endothelial.pt                      # Attention matrices (if enabled)
+├── pca_features_Endothelial.pt                   # PCA scores (if enabled)
+├── concept_attention_Endothelial.pt              # Concept attention maps (if enabled)
+├── concept_attention_analysis_Endothelial.json   # Processed concept scores (if enabled)
 ├── sample_Fibroblast.npz
 ├── final_Fibroblast.txt
 └── ...
@@ -211,6 +254,9 @@ results_dir/
 | `--attention_layer` | int | None | Specific layer for attention (default: last) |
 | `--save_pca_features` | flag | False | Enable PCA feature extraction |
 | `--pca_components` | int | 5 | Number of PCA components to extract |
+| `--save_concept_attention` | flag | False | Enable concept attention analysis |
+| `--concept_attention_layers` | str | None | Comma-separated layer indices (default: last 4) |
+| `--concept_attention_type` | str | specific | Type: 'specific' (target cell) or 'all' (all cells) |
 
 ### Performance Considerations
 
